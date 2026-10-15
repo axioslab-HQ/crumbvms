@@ -69,6 +69,7 @@ async fn seed_viewer_no_plates(pool: &Pool, cameras: &[Uuid]) -> SeededUser {
         view_plates: false,
         actuators: false,
         manage_channels: false,
+        record_now: false,
     };
     let role = db::create_role(pool, &unique("role"), &caps, cameras)
         .await
@@ -83,6 +84,7 @@ async fn seed_viewer_no_plates(pool: &Pool, cameras: &[Uuid]) -> SeededUser {
 async fn seed_channel_manager(pool: &Pool, cameras: &[Uuid]) -> SeededUser {
     let caps = Capabilities {
         manage_channels: true,
+        record_now: false,
         ..generous_viewer_caps()
     };
     let role_id = seed_viewer_role_with_caps(pool, cameras, caps).await;

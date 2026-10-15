@@ -326,6 +326,8 @@ pub struct CameraDto {
     pub motion_pixel_enabled: bool,
     pub motion_frigate_enabled: bool,
     pub motion_ha_enabled: bool,
+    /// Record on `POST /cameras/:id/record-now` requests (migration 0083).
+    pub motion_api_enabled: bool,
     /// Pixel detector when the pixel source is enabled: census / framediff / mog2 /
     /// opticalflow / ensemble.
     pub motion_algorithm: String,
@@ -454,6 +456,7 @@ pub struct UpdateCameraRequest {
     pub motion_pixel_enabled: Option<bool>,
     pub motion_frigate_enabled: Option<bool>,
     pub motion_ha_enabled: Option<bool>,
+    pub motion_api_enabled: Option<bool>,
     /// Change the pixel detector; omitted = unchanged.
     pub motion_algorithm: Option<String>,
     /// Change the camera form-factor glyph: `Some(Some("dome"))` sets it,

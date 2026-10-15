@@ -521,6 +521,167 @@ pub fn media_routes() -> Router<AppState> {
     Router::new()
         .route("/clip/:id/clip.mp4", get(get_clip_media))
         .route("/clip/:id/thumbnail.jpg", get(get_clip_thumbnail))
+        // Range clip for integrators: stitched from the recorded segments without
+        // re-encoding (see `get_range_clip`).
+        .route("/cameras/:camera_id/clip.mp4", get(get_range_clip))
+}
+
+// ─── range clips (integrations) ──────────────────────────────────────────────
+
+/// Longest window `GET /cameras/:camera_id/clip.mp4` will stitch. Longer pulls
+/// belong to the export job API (`POST /export`), which is asynchronous,
+/// cancellable and quota'd; this endpoint answers inline.
+const RANGE_CLIP_MAX_SECS: i64 = 600;
+
+/// `?start=&end=` (RFC 3339) for [`get_range_clip`].
+#[derive(Debug, Deserialize)]
+pub struct RangeClipQuery {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+/// `GET /cameras/:camera_id/clip.mp4?start=<rfc3339>&end=<rfc3339>` — the
+/// recorded footage of one camera for a time range as ONE faststart MP4,
+/// stitched from the 4 s segments with `-c copy` (no re-encode, so a 60 s clip
+/// costs about as much as copying 30 MB). For integrators that correlate an
+/// external event to footage (bookmark → clip) and want a single file rather
+/// than `/timeline` + N `/segments/:id` fetches.
+///
+/// * Authenticated like every media route (Bearer or a scoped `?token=`),
+///   gated on `playback` + camera access.
+/// * `start`/`end` must be ordered and span at most [`RANGE_CLIP_MAX_SECS`].
+/// * The clip starts on the keyframe at or before `start` (stream copy cannot
+///   cut mid-GOP, so the first frame can be up to one GOP early) and ends at
+///   `end`; a gap in the recording (motion mode, camera offline) is simply
+///   absent from the file.
+/// * `404` when no segment overlaps the range.
+/// * Cached under the export dir like the event clips, revalidated by `ETag`,
+///   bounded by the same clip-transcode semaphore and timeout.
+async fn get_range_clip(
+    // Media-read: played via scoped `?token=` from a browser, or Bearer from a
+    // service. Capability + camera scope enforced below.
+    MediaOrFullUser(user): MediaOrFullUser,
+    State(state): State<AppState>,
+    Path(camera_id): Path<Uuid>,
+    Query(q): Query<RangeClipQuery>,
+    req: Request,
+) -> Result<Response, ApiError> {
+    user.require_playback()?;
+    user.assert_camera_access(camera_id)?;
+    let span = (q.end - q.start).num_seconds();
+    if span <= 0 {
+        return Err(ApiError::BadRequest("end must be after start".to_owned()));
+    }
+    if span > RANGE_CLIP_MAX_SECS {
+        return Err(ApiError::BadRequest(format!(
+            "range must span at most {RANGE_CLIP_MAX_SECS} seconds; use POST /export for longer windows"
+        )));
+    }
+    let (start_ms, end_ms) = (q.start.timestamp_millis(), q.end.timestamp_millis());
+    let etag = format!("\"range:{camera_id}:{start_ms}:{end_ms}\"");
+    if let Some(resp) = not_modified_if_match(req.headers(), &etag) {
+        return Ok(resp);
+    }
+
+    let cache_dir = PathBuf::from(&state.config().export_dir).join("clips");
+    tokio::fs::create_dir_all(&cache_dir).await.ok();
+    let out = cache_dir.join(format!("range_{camera_id}_{start_ms}_{end_ms}.full.mp4"));
+    {
+        let lock = state.clip_inflight_lock(&out);
+        let _guard = lock.lock().await;
+        if tokio::fs::metadata(&out).await.is_err() {
+            generate_range_clip_file(&state, camera_id, q.start, q.end, &out).await?;
+            prune_clip_cache(&cache_dir, CLIP_RENDITION_CACHE_MAX_BYTES).await;
+        }
+    }
+
+    let resp = ServeFile::new(&out)
+        .oneshot(req)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("ServeFile: {e}")))?;
+    let (parts, body) = resp.into_parts();
+    let mut resp = Response::from_parts(parts, Body::new(body));
+    add_clip_cache_headers(&mut resp, &etag);
+    Ok(resp)
+}
+
+/// Stream-copy the segments overlapping `[start, end)` into a faststart MP4 at
+/// `out`. Same concat list, semaphore, temp-file-then-rename and timeout as
+/// [`generate_clip_file`]; the only difference is `-c copy` (no decode, no
+/// encode) with the input-side `-ss` that stream copy needs to land on a
+/// keyframe.
+async fn generate_range_clip_file(
+    state: &AppState,
+    camera_id: Uuid,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    out: &FsPath,
+) -> Result<(), ApiError> {
+    let _permit = crate::media_limits::acquire_bounded(
+        &state.clip_gen_semaphore(),
+        crate::media_limits::CLIP_GEN_WAIT,
+        "range clip",
+    )
+    .await?;
+    if tokio::fs::metadata(out).await.is_ok() {
+        return Ok(());
+    }
+    let (concat_path, ss, dur) = prepare_clip_inputs(state, camera_id, start, end).await?;
+    let tmp = out.with_file_name(format!("{}.partial.mp4", Uuid::new_v4()));
+    let args: Vec<String> = vec![
+        "-y".to_owned(),
+        // Input-side seek: with stream copy ffmpeg lands on the keyframe at or
+        // before the offset instead of emitting undecodable leading frames.
+        "-ss".to_owned(),
+        format!("{ss:.3}"),
+        "-f".to_owned(),
+        "concat".to_owned(),
+        "-safe".to_owned(),
+        "0".to_owned(),
+        "-i".to_owned(),
+        concat_path.to_string_lossy().into_owned(),
+        "-t".to_owned(),
+        format!("{dur:.3}"),
+        "-c".to_owned(),
+        "copy".to_owned(),
+        "-avoid_negative_ts".to_owned(),
+        "make_zero".to_owned(),
+        "-movflags".to_owned(),
+        "+faststart".to_owned(),
+        tmp.to_string_lossy().into_owned(),
+    ];
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(CLIP_TRANSCODE_TIMEOUT_SECS),
+        Command::new(FFMPEG_BIN)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await;
+    let _ = tokio::fs::remove_file(&concat_path).await;
+    match status {
+        Ok(Ok(s)) if s.success() => tokio::fs::rename(&tmp, out)
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("rename range clip: {e}"))),
+        Ok(Ok(s)) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(ApiError::Internal(anyhow::anyhow!(
+                "ffmpeg range clip exited with {s}"
+            )))
+        }
+        Ok(Err(e)) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(ApiError::Internal(anyhow::anyhow!("spawn ffmpeg: {e}")))
+        }
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(ApiError::Internal(anyhow::anyhow!(
+                "ffmpeg range clip timed out after {CLIP_TRANSCODE_TIMEOUT_SECS}s"
+            )))
+        }
+    }
 }
 
 /// Resolve a clip id to its overview render window + metadata. Pre-roll and

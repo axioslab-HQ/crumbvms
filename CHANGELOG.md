@@ -9,6 +9,26 @@ landed on `main`.
 Crumb is **alpha**. Versions before 1.0 make no compatibility promises, read the
 [Alpha Tester Terms](docs/ALPHA-TESTER-TERMS.md) before you rely on it.
 
+## [Unreleased]
+
+### Added
+
+- **An `api` motion source: integrations can trigger recording.**
+  `POST /cameras/:id/record-now {seconds, label?, pre_seconds?}` makes a
+  Motion-mode camera persist its RAM pre-roll and record for the window, as if
+  a detector had fired; a labeled `events` row marks the moment. Per-camera
+  opt-in (`motion_api_enabled`, migration 0083, off by default) and a new
+  deny-by-default `record_now` role capability for the integration's service
+  user. The request travels api → recorder over a durable
+  `motion_api_requests` table plus Postgres `LISTEN/NOTIFY`, so a recorder that
+  was down still honours the rest of the window when it returns; while its
+  listener is down the camera fails open. `docs/MOTION-RECORDING.md` §9,
+  `docs/DECISIONS.md` 2026-10-15.
+- **Range clips.** `GET /cameras/:id/clip.mp4?start&end` returns up to 10
+  minutes of one camera's footage as a single faststart MP4 stitched from the
+  recorded segments without re-encoding (`playback` capability; `POST /export`
+  remains the path for longer windows).
+
 ## [0.2.0] - 2026-08-09
 
 Where 0.1.1 hardened what was already there, 0.2.0 finishes a feature that had

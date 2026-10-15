@@ -662,6 +662,14 @@ pub struct Camera {
     pub motion_pixel_enabled: bool,
     pub motion_frigate_enabled: bool,
     pub motion_ha_enabled: bool,
+    /// `cameras.motion_api_enabled` (migration 0083) — the fourth additive
+    /// source: record on `POST /cameras/:id/record-now` requests
+    /// (`motion_api_requests` rows) raised by an integration. Off by default;
+    /// `services/recorder/src/api_trigger.rs`. Serde default so a `Camera`
+    /// serialised before this field existed (test fixtures, cached JSON) still
+    /// deserialises, reading as off.
+    #[serde(default)]
+    pub motion_api_enabled: bool,
     /// `cameras.motion_algorithm` — which pixel detector to run when the pixel
     /// source is enabled: `"census"` (default), `"framediff"`, `"mog2"`,
     /// `"opticalflow"`, or `"ensemble"`. Ignored by the Frigate/HA sources.
@@ -1204,6 +1212,14 @@ pub struct Capabilities {
     /// this.
     #[serde(default)]
     pub manage_channels: bool,
+    /// Trigger recording on a camera from outside (`POST /cameras/:id/record-now`,
+    /// migration 0083). A request writes footage to disk that would otherwise
+    /// evaporate from the motion RAM ring, so it is an integrator's action, not
+    /// a viewer's: defaults to `false` (absent ⇒ denied) and must be granted
+    /// explicitly, typically to a dedicated service user's role. Admins imply it;
+    /// a scoped media token never carries it.
+    #[serde(default)]
+    pub record_now: bool,
 }
 
 /// Serde default for capability fields that should read as granted (not the
@@ -1227,6 +1243,7 @@ impl Capabilities {
             view_plates: true,
             actuators: true,
             manage_channels: true,
+            record_now: true,
         }
     }
 }

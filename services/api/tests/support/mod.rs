@@ -94,6 +94,8 @@ pub mod ptz;
 // surface this harness compiles.
 #[path = "../../src/rate_limit.rs"]
 pub mod rate_limit;
+#[path = "../../src/record_now.rs"]
+pub mod record_now;
 #[path = "../../src/roles.rs"]
 pub mod roles;
 #[path = "../../src/scrub_settings.rs"]
@@ -413,6 +415,7 @@ pub fn test_router() -> Router<AppState> {
         .merge(stats::routes())
         .merge(stats::heavy_routes())
         .merge(ptz::routes())
+        .merge(record_now::routes())
         .merge(notifications::routes())
 }
 
@@ -546,6 +549,7 @@ pub fn generous_viewer_caps() -> Capabilities {
         view_plates: true,
         actuators: false,
         manage_channels: false,
+        record_now: false,
     }
 }
 
@@ -604,6 +608,7 @@ pub async fn seed_viewer_with_bookmark_scope(
         view_plates: true,
         actuators: false,
         manage_channels: false,
+        record_now: false,
     };
     let role = db::create_role(pool, &name, &caps, camera_ids)
         .await

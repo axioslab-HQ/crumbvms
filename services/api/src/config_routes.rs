@@ -1345,6 +1345,9 @@ async fn update_camera(
         .motion_frigate_enabled
         .unwrap_or(existing.motion_frigate_enabled);
     let motion_ha_enabled = body.motion_ha_enabled.unwrap_or(existing.motion_ha_enabled);
+    let motion_api_enabled = body
+        .motion_api_enabled
+        .unwrap_or(existing.motion_api_enabled);
 
     // camera_type: Option<Option<String>>. Omitted = keep existing; Some(None) or
     // Some(Some("")) = clear to NULL (generic icon); Some(Some(v)) = validated set.
@@ -1429,7 +1432,8 @@ async fn update_camera(
                 make                   = $26,
                 model                  = $27,
                 firmware               = $28,
-                ptz_control_enabled    = $29
+                ptz_control_enabled    = $29,
+                motion_api_enabled     = $30
             WHERE id = $1
             ",
             &[
@@ -1462,6 +1466,7 @@ async fn update_camera(
                 &model,
                 &firmware,
                 &ptz_control_enabled,
+                &motion_api_enabled,
             ],
         )
         .await
@@ -4869,6 +4874,7 @@ fn camera_to_dto(c: Camera) -> CameraDto {
         motion_pixel_enabled: c.motion_pixel_enabled,
         motion_frigate_enabled: c.motion_frigate_enabled,
         motion_ha_enabled: c.motion_ha_enabled,
+        motion_api_enabled: c.motion_api_enabled,
         motion_algorithm: c.motion_algorithm,
         camera_type: c.camera_type,
         icon: c.icon,

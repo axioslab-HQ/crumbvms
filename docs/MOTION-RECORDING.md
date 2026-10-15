@@ -297,3 +297,47 @@ trades against "might miss something":
   a few seconds more than requested, never less. This is a deliberate
   simplification (segment-level keep/discard, not sub-segment trimming) and
   matches how Frigate's segment mover behaves for the same reason.
+
+## 9. External trigger: the `api` source (record-now)
+
+Everything above is driven by detectors Crumb runs or subscribes to. The `api`
+source (migration 0083) lets an **integration** be the detector: an
+access-control or parking system that has just seen an event calls
+
+```
+POST /cameras/:id/record-now
+{ "seconds": 30, "label": "gate denied 7F-1234", "pre_seconds": 5 }
+```
+
+and the camera behaves exactly as if a pixel event had started at
+`now - pre_seconds` and stopped `seconds` later: the RAM ring is flushed from
+`started_at - motion_pre_seconds` (so the effective pre-roll is the policy's
+plus the caller's, bounded by what the ring still holds, about
+`motion_pre_seconds + 8 s`), every segment until `ends_at` is persisted, then
+the policy's `motion_post_seconds` post-roll runs down. Overlapping requests
+extend the one open window. A labeled `events` row (`source_id = 'api'`,
+label = the request's label or `record`) marks the window on the timeline and
+in `GET /events`. A Continuous-mode camera already records; the call still
+writes the event marker.
+
+Enable it per camera (`PUT /config/cameras/:id {"motion_api_enabled": true}`,
+or the **Record-now API** checkbox under Detection source) and grant the
+`record_now` role capability to the integration's service user. Off by
+default on both counts: a request costs the operator disk.
+
+**How the request reaches the recorder.** The recorder has no HTTP server.
+The api INSERTs a `motion_api_requests` row and raises
+`pg_notify('crumb_motion_api', …)` in the same statement; the recorder's
+`api_trigger::Hub` holds one dedicated `LISTEN` connection and wakes the
+camera's source loop within milliseconds. The **table** is the source of
+truth: when the loop starts (recorder boot, worker respawn, listener
+reconnect) it reloads every request whose window is still open, so a request
+made while the recorder was down is honoured for the remainder of its window.
+
+**Fail-open.** The `api` source is healthy only while the `LISTEN` connection
+is up. While it is down the camera fails open like any other dead source
+(records everything, `motion_health_reason` names the cause). An api-only
+camera therefore records on demand while the recorder can hear requests and
+continuously while it cannot: over-record, never loss.
+
+Design record: `docs/DECISIONS.md` (2026-10-15).

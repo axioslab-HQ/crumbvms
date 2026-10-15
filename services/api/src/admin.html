@@ -6500,13 +6500,14 @@ function renderCamMotionTab(c) {
       <!-- col 1: detection source + algorithm + "currently loaded" infobox -->
       <div class="policy-section" style="margin-top:0">
         <div class="policy-section-title">Detection source</div>
-        <div class="card-hint" style="margin:-2px 0 10px 2px">How recording is triggered. Enable one or more; the camera records on the <b>union</b> of every enabled source. <b>Pixel analysis</b> runs Crumb's own detector on the sub-stream; <b>Frigate detections</b> records when Frigate's object detector fires; <b>Home Assistant sensors</b> records when this camera's linked HA motion/door sensors fire (linked below). With none enabled a Motion-mode camera records everything (fail-open).</div>
+        <div class="card-hint" style="margin:-2px 0 10px 2px">How recording is triggered. Enable one or more; the camera records on the <b>union</b> of every enabled source. <b>Pixel analysis</b> runs Crumb's own detector on the sub-stream; <b>Frigate detections</b> records when Frigate's object detector fires; <b>Home Assistant sensors</b> records when this camera's linked HA motion/door sensors fire (linked below); <b>Record-now API</b> records when an integration calls <code>POST /cameras/:id/record-now</code> (needs the <i>Trigger recording</i> role capability). With none enabled a Motion-mode camera records everything (fail-open).</div>
         <div class="form-grid narrow" style="align-items:start">
           <label class="fg-label">Sources ${infoHint(MOTION_SOURCE_HINT)}</label>
           <div class="fg-ctl">
             <label class="chk"><input type="checkbox" id="ce-motion-pixel" ${(c.motion_pixel_enabled ?? ((c.motion_source||'pixel')==='pixel'))?'checked':''} onchange="ceMotionSourceChanged()"/> Pixel analysis (Crumb)</label>
             <label class="chk"><input type="checkbox" id="ce-motion-frigate" ${(c.motion_frigate_enabled ?? (c.motion_source==='frigate'))?'checked':''} onchange="ceMotionSourceChanged()"/> Frigate detections</label>
             <label class="chk"><input type="checkbox" id="ce-motion-ha" ${(c.motion_ha_enabled ?? (c.motion_source==='ha'))?'checked':''} onchange="ceMotionSourceChanged()"/> Home Assistant sensors</label>
+            <label class="chk"><input type="checkbox" id="ce-motion-api" ${c.motion_api_enabled?'checked':''} onchange="ceMotionSourceChanged()"/> Record-now API (integrations)</label>
           </div>
         </div>
         ${hasSub ? '' : `<div id="ce-motion-nosub-warn" class="warn-note hidden"><b>This camera has no sub-stream, so pixel analysis can't run.</b> Crumb's pixel detector reads the sub-stream only, so this camera produces no motion events, no timeline motion track and no motion clips — a Motion-mode policy falls back to recording continuously. Add a <b>sub-stream URL</b> on the <b>Connection</b> tab, or use Frigate detections / Home Assistant sensors as the motion source instead.</div>`}
@@ -6606,17 +6607,20 @@ function ceRenderDetectorBox(c) {
   const px = $('ce-motion-pixel') ? $('ce-motion-pixel').checked : !!c.motion_pixel_enabled;
   const fr = $('ce-motion-frigate') ? $('ce-motion-frigate').checked : !!c.motion_frigate_enabled;
   const ha = $('ce-motion-ha') ? $('ce-motion-ha').checked : !!c.motion_ha_enabled;
+  const ap = $('ce-motion-api') ? $('ce-motion-api').checked : !!c.motion_api_enabled;
   const savedAlgo = c.motion_algorithm || 'census';
   const pickedAlgo = $('ce-motion-algorithm') ? $('ce-motion-algorithm').value : savedAlgo;
   const names = [];
   if (px) names.push(`Pixel analysis, ${motionAlgoLabel(px ? pickedAlgo : savedAlgo)}`);
   if (fr) names.push('Frigate detections');
   if (ha) names.push('Home Assistant sensors');
+  if (ap) names.push('Record-now API');
   const loaded = names.length ? names.join(' + ') : 'NONE — records everything (fail-open)';
   // Pending = the pickers differ from the saved values (a change not yet saved).
   const changed = (px !== !!c.motion_pixel_enabled)
     || (fr !== !!c.motion_frigate_enabled)
     || (ha !== !!c.motion_ha_enabled)
+    || (ap !== !!c.motion_api_enabled)
     || (px && pickedAlgo !== savedAlgo);
   const note = changed
     ? 'Save to apply, the recorder reloads its sources and the live heatmap above will follow within a few seconds.'
@@ -8380,6 +8384,7 @@ async function saveCamEdit() {
     if ($('ce-motion-pixel')) camBody.motion_pixel_enabled = $('ce-motion-pixel').checked;
     if ($('ce-motion-frigate')) camBody.motion_frigate_enabled = $('ce-motion-frigate').checked;
     if ($('ce-motion-ha')) camBody.motion_ha_enabled = $('ce-motion-ha').checked;
+    if ($('ce-motion-api')) camBody.motion_api_enabled = $('ce-motion-api').checked;
     if ($('ce-motion-algorithm')) camBody.motion_algorithm = $('ce-motion-algorithm').value;
 
     // Exclusion zones (Detection tab). The painter's state lives in cmState, not
@@ -9900,7 +9905,7 @@ async function delUser(id) {
    ROLES, list / create / edit / delete
    REST: GET/POST /config/roles  ·  GET/PUT/DELETE /config/roles/:id
    Role shape: { id, name, is_admin, capabilities:{export,playback,clips,ptz,
-                 manage_views,bookmarks,view_plates,actuators,manage_channels},
+                 manage_views,bookmarks,view_plates,actuators,manage_channels,record_now},
                  camera_ids:[uuid], created_at }
 ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -9914,6 +9919,7 @@ const ROLE_CAP_FIELDS = [
   { key: 'view_plates',  label: 'View license plates', hint: 'Sensitive: see recognised license-plate reads and search the plate database for this role’s cameras.' },
   { key: 'actuators',    label: 'Control linked devices (locks, covers, switches) - default off', hint: 'Sensitive: operate PHYSICAL devices linked to this role’s cameras, garage doors, locks, lights, sirens. Off by default; seeing a camera never implies being able to work its devices.' },
   { key: 'manage_channels', label: 'Manage notification destinations - default off', hint: 'Add, edit, delete and test-send notification destinations (Discord, Slack, Telegram, ntfy, Pushover, webhook). Off by default; a destination tells the server to send alerts, with snapshot images, to a host you choose. Seeing existing destinations in the list is not affected.' },
+  { key: 'record_now', label: 'Trigger recording (record-now API) - default off', hint: 'Let an integration call POST /cameras/:id/record-now on this role’s cameras to persist the motion pre-roll and record for a window. Off by default; meant for a dedicated service user, not a viewer.' },
 ];
 
 /** Build the capability checkboxes + bookmarks selector for a role form. pfx = field prefix. */

@@ -32,6 +32,7 @@ fn caps(view_plates: bool, bookmarks: BookmarkScope) -> Capabilities {
         view_plates,
         actuators: false,
         manage_channels: false,
+        record_now: false,
     }
 }
 

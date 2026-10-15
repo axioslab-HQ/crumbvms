@@ -1696,6 +1696,9 @@ pub async fn run(
     if camera.motion_ha_enabled {
         enabled.push(SourceKind::Ha);
     }
+    if camera.motion_api_enabled {
+        enabled.push(SourceKind::Api);
+    }
     info!(
         camera_id = %camera_id,
         sources = ?enabled.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
@@ -1749,6 +1752,7 @@ pub async fn run(
     let mut pixel_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
     let mut frigate_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
     let mut ha_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
+    let mut api_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
     let mut src_txs: std::collections::HashMap<SourceKind, MotionHealthTx> =
         std::collections::HashMap::new();
     let mut task_kinds: std::collections::HashMap<tokio::task::Id, SourceKind> =
@@ -1810,6 +1814,7 @@ pub async fn run(
             SourceKind::Pixel => pixel_rx = Some(src_rx),
             SourceKind::Frigate => frigate_rx = Some(src_rx),
             SourceKind::Ha => ha_rx = Some(src_rx),
+            SourceKind::Api => api_rx = Some(src_rx),
         }
         src_txs.insert(kind, src_tx.clone());
         let gate = UnhealthyAlertGate::new();
@@ -1830,6 +1835,7 @@ pub async fn run(
                 pixel_rx,
                 frigate_rx,
                 ha_rx,
+                api_rx,
                 health_tx,
                 camera_id,
                 pool,
@@ -2181,6 +2187,53 @@ async fn run_one_source(
                     Ok(())
                 }
             }
+            SourceKind::Api => {
+                // The record-now source needs no decode of its own; only claim
+                // the decode-status slot when no pixel detector shares the camera.
+                if !camera.motion_pixel_enabled {
+                    report_decode_status(
+                        &pool,
+                        camera.id,
+                        config.motion_hwaccel.as_str(),
+                        "none",
+                        Some("motion source is the record-now API (no local decode)"),
+                    )
+                    .await;
+                }
+                // Start PESSIMISTIC: healthy only once the LISTEN hub is up and
+                // the open-request catch-up succeeded (api_trigger.rs flips it).
+                report_health(
+                    &health_tx,
+                    &pool,
+                    camera.id,
+                    false,
+                    "api trigger connecting",
+                    &alert_gate,
+                    alert_after_secs,
+                )
+                .await;
+                let r = crate::api_trigger::run_api_motion_loop(
+                    &camera,
+                    &motion_tx,
+                    &cancel,
+                    &pool,
+                    &health_tx,
+                    &alert_gate,
+                    alert_after_secs,
+                )
+                .await;
+                report_health(
+                    &health_tx,
+                    &pool,
+                    camera.id,
+                    false,
+                    "api trigger loop exited",
+                    &alert_gate,
+                    alert_after_secs,
+                )
+                .await;
+                r
+            }
         };
 
         match loop_result {
@@ -2247,6 +2300,7 @@ async fn aggregate_health(
     mut pixel_rx: Option<tokio::sync::watch::Receiver<bool>>,
     mut frigate_rx: Option<tokio::sync::watch::Receiver<bool>>,
     mut ha_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    mut api_rx: Option<tokio::sync::watch::Receiver<bool>>,
     health_tx: MotionHealthTx,
     camera_id: uuid::Uuid,
     pool: Pool,
@@ -2276,6 +2330,7 @@ async fn aggregate_health(
             (SourceKind::Pixel, &pixel_rx),
             (SourceKind::Frigate, &frigate_rx),
             (SourceKind::Ha, &ha_rx),
+            (SourceKind::Api, &api_rx),
         ] {
             if !enabled.contains(&kind) {
                 continue;
@@ -2357,6 +2412,7 @@ async fn aggregate_health(
             _ = changed_opt(&mut pixel_rx) => {}
             _ = changed_opt(&mut frigate_rx) => {}
             _ = changed_opt(&mut ha_rx) => {}
+            _ = changed_opt(&mut api_rx) => {}
         }
     }
 
@@ -7604,6 +7660,7 @@ mod tests {
         let aggregator = tokio::spawn(aggregate_health(
             vec![SourceKind::Pixel],
             Some(src_rx),
+            None,
             None,
             None,
             cam_tx,

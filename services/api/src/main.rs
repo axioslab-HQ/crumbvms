@@ -103,6 +103,7 @@ mod plates;
 mod playback;
 mod ptz;
 mod rate_limit;
+mod record_now;
 mod response_headers;
 mod roles;
 mod scrub_settings;
@@ -544,6 +545,8 @@ async fn main() -> anyhow::Result<()> {
             .merge(diagnostics::routes())
             .merge(stats::routes())
             .merge(ptz::routes())
+            // Externally triggered recording (record-now API, migration 0083).
+            .merge(record_now::routes())
             // Detection events list (authenticated, subject to rate-limit + gzip).
             // Snapshot proxy is in media_routes below (authenticated via ?token=, no timeout).
             .merge(events::json_routes())

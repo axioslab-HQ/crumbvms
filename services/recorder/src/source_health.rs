@@ -42,6 +42,8 @@ pub enum SourceKind {
     Pixel,
     Frigate,
     Ha,
+    /// Externally triggered (`POST /cameras/:id/record-now`); `api_trigger.rs`.
+    Api,
 }
 
 impl SourceKind {
@@ -52,6 +54,7 @@ impl SourceKind {
             SourceKind::Pixel => "pixel",
             SourceKind::Frigate => "frigate",
             SourceKind::Ha => "ha",
+            SourceKind::Api => "api",
         }
     }
 }

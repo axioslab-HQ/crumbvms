@@ -8,6 +8,65 @@ revisit.
 
 ---
 
+## 2026-10-15, An `api` motion source: integrators trigger recording through the api, carried to the recorder over Postgres LISTEN/NOTIFY on a durable request table
+
+**Context.** Access-control and parking systems want to say "something just
+happened at this camera, keep the footage" without running Frigate or Home
+Assistant. Crumb's Motion mode already has the right primitive (a RAM pre-roll
+ring that persists on a trigger), but every trigger source was a detector the
+recorder polls or subscribes to; there was no way for an external program to
+inject one. The additive-source model (2026-07-10) anticipated more sources;
+this adds the fourth: `api`.
+
+**Decision, model.** `api` is an ordinary additive source: a `cameras.motion_api_enabled`
+boolean (migration 0083, `NOT NULL DEFAULT false`, so nothing changes on
+upgrade), a `SourceKind::Api` loop under `motion::run`, edges into the same
+`MotionUnion`, health into the same `FailOpenGate`. The trigger is
+`POST /cameras/:id/record-now {seconds, label?, pre_seconds?}` (`202`), gated
+by a new deny-by-default `record_now` role capability plus camera scope, for a
+dedicated service user. Rejected: an implicit source that is always on (a
+camera with only `api` enabled is a legitimate "record on demand only" mode,
+and its health must be a real signal: implicit-on would have let a dead
+listener silently mask a dead pixel detector's fail-open); a Continuous-mode
+toggle ("switch the camera to continuous for N seconds") because that gives no
+pre-roll, which is the whole point.
+
+**Decision, transport.** The recorder has no HTTP server and gets none (golden
+rule 1). The api INSERTs a `motion_api_requests` row (`started_at = now −
+pre_seconds`, `ends_at = now + seconds`) and raises `pg_notify('crumb_motion_api',
+{camera_id, request_id})` in the same statement; the recorder holds ONE
+dedicated `LISTEN` connection (`api_trigger::Hub`, a process-wide `OnceLock`,
+started after the single-writer lock) and fans notices to per-camera loops over
+a broadcast channel. The table is the source of truth: a loop (re)loads every
+request whose `ends_at > now()` when it starts, so a request made while the
+recorder was down or reconnecting is honoured for the rest of its window; a
+lagged broadcast reloads from the table. Rejected: polling the table on
+`CONFIG_POLL_SECONDS` (30 s latency defeats a 5 s pre-roll); an HTTP or MQTT
+endpoint on the recorder (a new listener, a new secret, and MQTT is optional
+here); notification-only without the table (a missed notice would lose a
+request, and the recorder must not depend on being up at the instant of the
+call).
+
+**Decision, health.** The source is healthy only while the LISTEN connection is
+up and the catch-up query succeeded; otherwise its loop exits `Err`, the camera
+fails OPEN, and `motion_health_reason` says why. Trade accepted: an api-only
+camera records continuously during a database connection outage. Over-record,
+never loss (golden rule 2).
+
+**Trade-offs accepted.** The hub is a process global (mirrors
+`init_nvdec_semaphore`) rather than threaded through `CameraWorker::spawn`;
+`pre_seconds` extends the policy pre-roll only as far as the ring still holds
+(`motion_pre_seconds + RING_SLACK_SECS`); overlapping requests extend one open
+window rather than opening a second event.
+
+**Revisit when:** a second external trigger kind appears (schedules, a webhook
+in), which argues for a generic `trigger_requests` table with a `kind`; the
+recorder grows a control-plane transport for another reason (then the hub rides
+it); or a site needs sub-100 ms trigger-to-persist latency (then measure the
+NOTIFY path before redesigning: in the spike it was well under a second).
+
+---
+
 ## 2026-10-08, Eviction under a full or missing disk: the archive tier gets its own floor, failing moves fall back to deleting live footage on the low disk, and sweeps never prune or write on an unconfirmed storage
 
 **Context.** Audit findings R2 to R7 against `services/recorder/src/archive.rs`:

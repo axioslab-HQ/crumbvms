@@ -329,6 +329,7 @@ async fn non_admin_cannot_toggle_global() {
     // about the global scope specifically and not about `manage_channels`.
     let caps = crumb_common::types::Capabilities {
         manage_channels: true,
+        record_now: false,
         ..generous_viewer_caps()
     };
     let role_id = seed_viewer_role_with_caps(app.pool(), &[], caps).await;

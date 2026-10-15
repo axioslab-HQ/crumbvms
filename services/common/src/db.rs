@@ -669,6 +669,8 @@ fn camera_from_row(row: &tokio_postgres::Row) -> Result<Camera> {
                 .map(|s| s == "ha")
                 .unwrap_or(false)
         }),
+        // migration 0083 — absent (view predates the column) reads as off.
+        motion_api_enabled: row.try_get("c_motion_api_enabled").unwrap_or(false),
         motion_algorithm: row.get("c_motion_algorithm"),
         camera_type: row.get("c_camera_type"),
         icon: row.get("c_icon"),
@@ -9162,6 +9164,182 @@ pub struct UpsertDetectionEventParams {
     pub lifecycle: String,
 }
 
+// ─── motion_api_requests (migration 0083) ───────────────────────────────────
+
+/// The `NOTIFY` channel the api raises on every record-now request and the
+/// recorder's `api_trigger::Hub` listens on. Payload:
+/// `{"camera_id": <uuid>, "request_id": <uuid>}`.
+pub const MOTION_API_NOTIFY_CHANNEL: &str = "crumb_motion_api";
+
+/// One `motion_api_requests` row — a record-now window for a camera.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MotionApiRequest {
+    pub id: Uuid,
+    pub camera_id: Uuid,
+    pub requested_by: Option<Uuid>,
+    pub label: Option<String>,
+    pub pre_seconds: i32,
+    /// Start of the window the recorder must keep (request time minus the
+    /// caller's extra pre-roll).
+    pub started_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+fn motion_api_request_from_row(row: &tokio_postgres::Row) -> MotionApiRequest {
+    MotionApiRequest {
+        id: row.get("id"),
+        camera_id: row.get("camera_id"),
+        requested_by: row.get("requested_by"),
+        label: row.get("label"),
+        pre_seconds: row.get("pre_seconds"),
+        started_at: row.get("started_at"),
+        ends_at: row.get("ends_at"),
+        created_at: row.get("created_at"),
+    }
+}
+
+/// Parameters for [`create_motion_api_request`].
+#[derive(Debug, Clone)]
+pub struct CreateMotionApiRequestParams<'a> {
+    pub camera_id: Uuid,
+    pub requested_by: Option<Uuid>,
+    pub label: Option<&'a str>,
+    pub pre_seconds: i32,
+    pub started_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+}
+
+/// Insert a record-now request AND raise the `NOTIFY` in the same statement,
+/// so the recorder's listener wakes the moment the row is visible. The row is
+/// the source of truth; the notification is only the wake-up
+/// (`services/recorder/src/api_trigger.rs`).
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub async fn create_motion_api_request(
+    pool: &Pool,
+    p: &CreateMotionApiRequestParams<'_>,
+) -> Result<MotionApiRequest> {
+    let client = get_conn(pool).await?;
+    let row = client
+        .query_one(
+            r"
+            WITH ins AS (
+                INSERT INTO motion_api_requests
+                    (camera_id, requested_by, label, pre_seconds, started_at, ends_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, camera_id, requested_by, label, pre_seconds,
+                          started_at, ends_at, created_at
+            )
+            SELECT ins.id, ins.camera_id, ins.requested_by, ins.label, ins.pre_seconds,
+                   ins.started_at, ins.ends_at, ins.created_at,
+                   pg_notify($7, json_build_object('camera_id', ins.camera_id,
+                                                   'request_id', ins.id)::text) AS notified
+            FROM ins
+            ",
+            &[
+                &p.camera_id,
+                &p.requested_by,
+                &p.label,
+                &p.pre_seconds,
+                &p.started_at,
+                &p.ends_at,
+                &MOTION_API_NOTIFY_CHANNEL,
+            ],
+        )
+        .await
+        .context("create_motion_api_request")?;
+    Ok(motion_api_request_from_row(&row))
+}
+
+/// Fetch one request by id (the recorder resolves a notice to its row).
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub async fn get_motion_api_request(pool: &Pool, id: Uuid) -> Result<Option<MotionApiRequest>> {
+    let client = get_conn(pool).await?;
+    let opt = client
+        .query_opt(
+            r"SELECT id, camera_id, requested_by, label, pre_seconds,
+                     started_at, ends_at, created_at
+              FROM motion_api_requests WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .context("get_motion_api_request")?;
+    Ok(opt.as_ref().map(motion_api_request_from_row))
+}
+
+/// Every request for `camera_id` whose window is still open at `now`
+/// (`ends_at > now`), oldest first — the recorder's durable catch-up on
+/// (re)start, so a request made while it was down is still honoured.
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub async fn list_open_motion_api_requests(
+    pool: &Pool,
+    camera_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Vec<MotionApiRequest>> {
+    let client = get_conn(pool).await?;
+    let rows = client
+        .query(
+            r"SELECT id, camera_id, requested_by, label, pre_seconds,
+                     started_at, ends_at, created_at
+              FROM motion_api_requests
+              WHERE camera_id = $1 AND ends_at > $2
+              ORDER BY started_at ASC, id ASC",
+            &[&camera_id, &now],
+        )
+        .await
+        .context("list_open_motion_api_requests")?;
+    Ok(rows.iter().map(motion_api_request_from_row).collect())
+}
+
+/// Persist (or update) an api-sourced motion event in the shared `events`
+/// table, labeled by the caller's `label` (default `"record"`), so a record-now
+/// window shows on the timeline and in `GET /events` like any other source's
+/// event. Surfacing only — never gates footage.
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub async fn upsert_api_event(
+    pool: &Pool,
+    camera_id: Uuid,
+    label: &str,
+    started_at: DateTime<Utc>,
+    stopped_at: Option<DateTime<Utc>>,
+    request_ids: &[Uuid],
+) -> Result<Uuid> {
+    let provider_event_id = format!("api:{}:{}", camera_id, started_at.timestamp_millis());
+    let lifecycle = if stopped_at.is_some() { "end" } else { "start" };
+    let params = UpsertDetectionEventParams {
+        camera_id,
+        start_ts: started_at,
+        label: label.to_owned(),
+        score: 1.0, // an explicit request has no confidence score
+        source_id: "api".to_owned(),
+        provider_event_id,
+        sub_label: None,
+        top_score: 1.0,
+        end_ts: stopped_at,
+        zones: Vec::new(),
+        snapshot_url: None,
+        raw: serde_json::json!({
+            "source": "api",
+            "label": label,
+            "request_ids": request_ids,
+        }),
+        lifecycle: lifecycle.to_owned(),
+    };
+    upsert_detection_event(pool, &params).await
+}
+
 // ─── plate reads (plate_reads, migration 0051) ──────────────────────────────
 
 /// Normalize a plate for storage + search: uppercase ASCII alphanumerics only
@@ -11474,6 +11652,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0082_events_ts_index.sql",
         include_str!("../../../db/migrations/0082_events_ts_index.sql"),
+    ),
+    (
+        "0083_motion_api_source.sql",
+        include_str!("../../../db/migrations/0083_motion_api_source.sql"),
     ),
 ];
 

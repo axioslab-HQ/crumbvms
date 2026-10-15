@@ -62,6 +62,7 @@ use uuid::Uuid;
 /// missed tick.
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 10;
 
+mod api_trigger;
 mod archive;
 mod decode_probe;
 mod frigate_motion;
@@ -319,6 +320,7 @@ struct CameraFingerprint {
     motion_pixel_enabled: bool,
     motion_frigate_enabled: bool,
     motion_ha_enabled: bool,
+    motion_api_enabled: bool,
     motion_algorithm: String,
     // Effective motion-decode backend (server_settings.motion_hwaccel + vaapi
     // device, admin-editable; empty ⇒ env default). Folded into the per-camera
@@ -376,6 +378,7 @@ impl CameraFingerprint {
             motion_pixel_enabled: c.motion_pixel_enabled,
             motion_frigate_enabled: c.motion_frigate_enabled,
             motion_ha_enabled: c.motion_ha_enabled,
+            motion_api_enabled: c.motion_api_enabled,
             motion_algorithm: c.motion_algorithm.clone(),
             motion_hwaccel: motion_hwaccel.to_owned(),
             motion_vaapi_device: motion_vaapi_device.to_owned(),
@@ -1392,6 +1395,11 @@ async fn main() -> Result<()> {
         }
     };
 
+    // The `api` motion source's process-wide LISTEN hub (docs/MOTION-RECORDING.md
+    // §9). Started only once the single-writer lock is held, so a second recorder
+    // never opens a listener; per-camera loops subscribe via `Hub::global()`.
+    api_trigger::Hub::start(config.database_url.clone(), shutdown.clone());
+
     // Reset any storage-migration rows stuck in 'running' (process died
     // mid-drain). R7: this MUST run AFTER the singleton lock is held, not
     // before — a second recorder booting concurrently with a first (which is
@@ -1556,6 +1564,7 @@ mod tests {
             motion_pixel_enabled: true,
             motion_frigate_enabled: false,
             motion_ha_enabled: false,
+            motion_api_enabled: false,
             motion_algorithm: "census".to_owned(),
             camera_type: None,
             icon: None,

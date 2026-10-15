@@ -205,6 +205,14 @@ impl AuthUser {
     pub fn can_manage_channels(&self) -> bool {
         self.is_admin() || self.capabilities.manage_channels
     }
+    /// Trigger recording from outside (`POST /cameras/:id/record-now`).
+    /// Deny-by-default: a role must be granted `record_now` explicitly, and a
+    /// scoped media principal never carries it (see
+    /// [`media_capabilities_from_claims`]).
+    #[inline]
+    pub fn can_record_now(&self) -> bool {
+        self.is_admin() || self.capabilities.record_now
+    }
     /// Effective bookmark visibility (admins see all).
     #[inline]
     pub fn bookmarks_scope(&self) -> BookmarkScope {
@@ -254,6 +262,9 @@ impl AuthUser {
     pub fn require_manage_channels(&self) -> Result<(), ApiError> {
         Self::require(self.can_manage_channels(), "managing notification channels")
     }
+    pub fn require_record_now(&self) -> Result<(), ApiError> {
+        Self::require(self.can_record_now(), "triggering recording")
+    }
 }
 
 /// Conservative capabilities for a token that carries no resolvable role
@@ -272,6 +283,7 @@ fn fallback_caps(role: UserRole) -> Capabilities {
             view_plates: false,
             actuators: false,
             manage_channels: false,
+            record_now: false,
         },
     }
 }
@@ -735,6 +747,7 @@ fn media_capabilities_from_claims(claims: &MediaClaims) -> Capabilities {
         bookmarks: BookmarkScope::None,
         manage_views: false,
         manage_channels: false,
+        record_now: false,
     }
 }
 
